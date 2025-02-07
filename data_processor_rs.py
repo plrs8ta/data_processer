@@ -299,7 +299,7 @@ def filter_data(df: pl.DataFrame = None,
         (pl.col('time') >= start_time) &
         (pl.col('time') <= end_time) &
         # (pl.col('operatingmode_cntmax') == filter_turbine_operation_mode) &
-        (pl.col('pitchangle1_avg').abs() <= filter_pitch_angle)
+        (pl.col('pitchangle1_avg').abs() < filter_pitch_angle)
     )
     
     # Group by time window and turbine_id, then calculate averages
@@ -552,12 +552,12 @@ def compute_weight_power(
     # 假设df_power_curve中有turbine_id和power_mean列
     # 将power_curve数据与风频分布合并
     result = (df_power_curve
-             .join(df_wind_probability, on='label_normalized_windspeedbin_byairdensity')
+             .join(df_wind_probability, on=['turbine_id', 'label_normalized_windspeedbin_byairdensity'])
              .with_columns((pl.col('power_mean') * pl.col('probability')).alias('weighted_power')))
     
     return result
 
-# %%
+# %% Main processing
 if __name__ == '__main__':
     
     df = pl.read_parquet(PATH_PARQUET_FILE_SCADA24)
@@ -570,4 +570,16 @@ if __name__ == '__main__':
     df_wp = compute_weight_power(df_pc, df_wind_probability)
 
 
-# %%
+# %% 
+df_SCADA23 = pl.read_csv(r"D:\temp_data\SCADAdata_23\aggregated_data_60s(test_51turbines_ori)_result.csv")
+df_SCADA24 = pl.read_csv(r"D:\temp_data\SCADAdata_24\my2000_onedata_202501231426_result.csv")
+# df_SCADA23 = df_SCADA23.select(pl.all().name.suffix('_SCADA23'))
+# df_SCADA23
+# df_SCADA24 = df_SCADA24.select(pl.all().name.suffix('_SCADA24'))
+# df_SCADA24
+df_merge = df_SCADA23.join(
+    df_SCADA24, 
+    on=['turbine_id', 'label_normalized_windspeedbin_byairdensity'], 
+    # right_on=['turbine_id_SCADA24', 'label_normalized_windspeedbin_byairdensity_SCADA24'], 
+    how='left'
+    )
