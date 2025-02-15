@@ -132,8 +132,7 @@ def label_timeseria_type(df: pl.DataFrame = None,
     ])
 
     timeseria_problem_data_dict['idtime_duplicated_data'] = df.filter(pl.col('label_idtime_duplicated') != 0)
-
-    # todo: check below code here
+    
     # Label time continuity type
     df = df.with_columns([
         pl.col('time').diff().over('turbine_id').alias('time_interval')
@@ -159,7 +158,7 @@ def label_timeseria_type(df: pl.DataFrame = None,
     print(timeseria_problem_data_dict)
 
     # Drop temporary columns
-    df = df.drop(['time_interval', 'is_duplicate', 'is_duplicate_not_first'])
+    df = df.drop(['time_interval', 'idtime_is_duplicated', 'idtime', 'idtime_is_first_distinct'])
 
     return df
 
