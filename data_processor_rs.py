@@ -163,6 +163,88 @@ def label_timeseria_type(df: pl.DataFrame = None,
     return df
 
 
+def label_outliers_type(df: pl.DataFrame = None,
+                       column_float_type: list = ['windspeed_avg', 'winddirection_avg'],
+                       continuety_num: int = 3) -> pl.DataFrame:
+    """
+    Label outliers type
+
+    Args:
+        df (pl.DataFrame, optional): Data to label outliers type. Defaults to None.
+        column_float_type (list, optional): Float type column list. Defaults to LIST_BASIC_COLUMN.
+        continuety_num (int, optional): Value continuety occur times. Defaults to 3.
+
+    Returns:
+        pl.DataFrame: Data with labeled outliers type
+    """
+
+    if df is None:
+        df = pl.read_parquet(PATH_PARQUET_FILE)
+
+    outlier_problem_dict = {}
+    
+    # Get numeric columns excluding time and turbine_id
+    num_col_list = [col for col in df.columns if col not in ['time', 'turbine_id']]
+    
+    # Label NaN types
+    df = df.with_columns([
+        pl.when(~pl.any_horizontal(pl.col(num_col_list).is_null()))
+        .then(0)
+        .when(pl.any_horizontal(pl.col(num_col_list).is_null()) & 
+              ~pl.all_horizontal(pl.col(num_col_list).is_null()))
+        .then(1)
+        .when(pl.all_horizontal(pl.col(num_col_list).is_null()))
+        .then(2)
+        .otherwise(0)
+        .alias('label_NaN_type')
+    ])
+    
+    # Store NaN data in outlier problem dict
+    outlier_problem_dict['NaN_data'] = df.filter(pl.col('label_NaN_type') != 0)
+    
+    # Label continuous duplicate values
+    col_float_set = set(df.columns) & set(column_float_type)
+    
+    # Filter and sort data
+    df_filtered = df.filter(
+        (pl.col('label_idtime_null') == 0) & 
+        (pl.col('label_idtime_duplicated') != 2)
+    ).sort(['turbine_id', 'time'])
+    
+    # Todo: Check from here
+    # Check for continuous duplicate values
+    for col in col_float_set:
+        df = df.with_columns([
+            (pl.col(col).eq(pl.col(col).shift(-1)) & 
+             pl.col(col).eq(pl.col(col).shift(-2)))
+            .fill_null(False)
+            .alias(f'continue_duplicate_type_{col}')
+        ])
+        
+        # Update shifted values
+        df = df.with_columns([
+            pl.when(pl.col(f'continue_duplicate_type_{col}'))
+            .then(pl.col(f'continue_duplicate_type_{col}').shift(1))
+            .otherwise(pl.col(f'continue_duplicate_type_{col}'))
+            .alias(f'continue_duplicate_type_{col}')
+        ])
+        
+        df = df.with_columns([
+            pl.when(pl.col(f'continue_duplicate_type_{col}'))
+            .then(pl.col(f'continue_duplicate_type_{col}').shift(2))
+            .otherwise(pl.col(f'continue_duplicate_type_{col}'))
+            .alias(f'continue_duplicate_type_{col}')
+        ])
+    
+    # Label out-of-range wind speed
+    df = df.with_columns([
+        ((pl.col('windspeed_avg') >= 30) | (pl.col('windspeed_avg') < 0))
+        .alias('label_overrange_windspeed')
+    ])
+    
+    return df
+
+
 def filter_data(df: pl.DataFrame = None,
                 filter_time_range: list = [20231013, 20231216],
                 average_time_interval: int = 600,
