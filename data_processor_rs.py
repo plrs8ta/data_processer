@@ -242,71 +242,257 @@ def label_outliers_type(df: pl.DataFrame = None,
         .alias('label_overrange_windspeed')
     ])
     
+    print(outlier_problem_dict)
+
     return df
 
 
-def filter_data(df: pl.DataFrame = None,
-                filter_time_range: list = [20231013, 20231216],
-                average_time_interval: int = 600,
-                filter_turbine_operation_mode: int = 20, 
-                filter_pitch_angle: int = 3, 
-                ) -> pl.DataFrame:
+def label_situations_type(df: pl.DataFrame,
+    rated_power:int=RATED_POWER,
+    pitch_limit:int=4,
+) -> pl.DataFrame:
     """
-    Filter data based on specified conditions
-    
+    打特殊工况标签。
+    24.8.12 调频限电目前没有限电标志位，
+    24.8.12 惯量调频。
+
     Args:
-        df (pl.DataFrame, optional): Input DataFrame. Defaults to None.
-        filter_time_range (list): Start and end dates in YYYYMMDD format
-        average_time_interval (int): Time interval in seconds for data averaging
-        filter_turbine_operation_mode (int): Operating mode to filter
-        filter_pitch_angle (int): Maximum pitch angle for filtering
-        
+        df (pl.DataFrame): 打完异常数据标签后的数据。
+        rated_wind_speed (int, optional): 额定风速。 Defaults to 10.
+        pitch_limit (int, optional): 变桨限值。 Defaults to 4.
+
     Returns:
-        pl.DataFrame: Filtered DataFrame
+        pl.DataFrame: 打完工况后的标签。
     """
-    if df is None:
-        df = pl.read_parquet(PATH_PARQUET_FILE)
     
-    # Convert time range to datetime
-    start_time = pl.datetime(
-        year=int(str(filter_time_range[0])[:4]),
-        month=int(str(filter_time_range[0])[4:6]),
-        day=int(str(filter_time_range[0])[6:8])
+    # Create conditions for different limitation levels
+    df = df.with_columns([
+        pl.when((pl.col('power_avg') <= rated_power) & 
+               (pl.col('pitchangle1_avg') >= pitch_limit))
+        .then(1)
+        .when((pl.col('power_avg') <= rated_power * 0.5) & 
+              (pl.col('pitchangle1_avg') >= pitch_limit * 0.5))
+        .then(2)
+        .when((pl.col('power_avg') <= rated_power * 0.25) & 
+              (pl.col('pitchangle1_avg') >= pitch_limit * 0.25))
+        .then(3)
+        .otherwise(0)
+        .alias('label_condiction_limited')
+    ])
+    
+    # Create dictionary of limited situations
+    situation_dict = {
+        'limited situation data': df.filter(pl.col('label_condiction_limited') != 0)
+    }
+    
+    print("工况字典: \n", situation_dict)
+    
+    return df
+
+def label_operation(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    对风向数据进行分类标签化处理。
+
+    Args:
+        df (pl.DataFrame): 包含风向数据的 DataFrame。
+
+    Returns:
+        pl.DataFrame: 包含风向分类标签的 DataFrame。
+    """
+    # 创建风向划分的区间（每 22.5 度一个区间），从 0 到 360 度
+    wdb = np.arange(0, 382.5, 22.5)
+    wdb_label = [i for i in range(16)]
+    
+    # 使用 polars 的 cut 函数对风向数据进行分箱
+    df = df.with_columns([
+        pl.col('winddirection_avg')
+        .cut(
+            breaks=wdb.tolist(),
+            labels=wdb_label,
+            left_closed=False,
+        )
+        .alias('label_wdb')
+    ])
+    
+    # 对偏航位置进行同样的处理
+    npb = np.arange(0, 382.5, 22.5)
+    npb_label = [i for i in range(16)]
+    
+    df = df.with_columns([
+        pl.col('yawposition_avg')
+        .cut(
+            breaks=npb.tolist(),
+            labels=npb_label,
+            left_closed=False,
+        )
+        .alias('label_npb')
+    ])
+
+    return df
+
+def integrity_validation(
+    df: pl.DataFrame = None,
+    validation_windspeedbinvalue: float = 0.5,
+    validation_windspeedmax: float = 15.25,
+    validation_windspeedmin: float = 2.25,
+    validation_wholecumtime: float = 180.0 * 60.0 * 60.0,
+    validation_bincumtime: float = 0.5 * 60.0 * 60.0,
+) -> pl.DataFrame:
+    """
+    验证数据完整性，包括风速分箱和累计时间检查。
+
+    Args:
+        df (pl.DataFrame): 需要验证的数据集，包含 'windspeed_avg', 'time', 和 'turbine_id' 列。
+        validation_windspeedbinvalue (float): 风速分箱的步长。 Defaults to 0.5.
+        validation_windspeedmax (float): 风速分箱的最大值。 Defaults to 15.25.
+        validation_windspeedmin (float): 风速分箱的最小值。 Defaults to 2.25.
+        validation_wholecumtime (float): 累计时间的最小阈值（秒）。 Defaults to 180*60*60 (5 hours).
+        validation_bincumtime (float): 每个风速分箱的最小累计时间（秒）。 Defaults to 0.5*60*60 (30 minutes).
+
+    Returns:
+        pl.DataFrame: 包含满足条件的 DataFrame。
+    """
+
+    # 初始化用于存储完整性问题的字典。
+    integrity_problem_dict = {}
+    
+    # 创建风速分箱区间，并生成对应的标签。
+    validation_windspeedbin = np.arange(
+        validation_windspeedmin, 
+        validation_windspeedmax + validation_windspeedbinvalue, 
+        validation_windspeedbinvalue
     )
-    end_time = pl.datetime(
-        year=int(str(filter_time_range[1])[:4]),
-        month=int(str(filter_time_range[1])[4:6]),
-        day=int(str(filter_time_range[1])[6:8])
+    validation_bins_label = [
+        f'({validation_windspeedbin[i]}, {validation_windspeedbin[i+1]})'
+        for i in range(len(validation_windspeedbin)-1)
+    ]
+    
+    # 将 'windspeed_avg' 列的数据划分到指定的风速分箱中
+    df = df.with_columns([
+        pl.col('windspeed_avg')
+        .cut(
+            breaks=validation_windspeedbin.tolist(),
+            labels=validation_bins_label,
+            left_closed=False,
+        )
+        .alias('label_windspeedbin')
+    ])
+
+    # 计算时间间隔
+    df = df.with_columns([
+        pl.col('time').diff().over('turbine_id').alias('time_interval')
+    ])
+
+    # 计算每个机组的累计时间
+    wholecumtime = df.group_by('turbine_id').agg([
+        pl.col('time_interval').sum().alias('total_time')
+    ])
+    
+    # 找出满足累计时间条件的风机ID
+    wholecumtime_satisfy_idlist = wholecumtime.filter(
+        pl.col('total_time') >= pl.duration(seconds=validation_wholecumtime)
+    ).get_column('turbine_id')
+
+    # 筛选出累计时间满足条件的风机数据
+    df_wholecumtime_satisfy = df.filter(
+        pl.col('turbine_id').is_in(wholecumtime_satisfy_idlist)
     )
-    
-    # Apply filters
-    filtered_df = df.filter(
-        (pl.col('time') >= start_time) &
-        (pl.col('time') <= end_time) &
-        # (pl.col('operatingmode_cntmax') == filter_turbine_operation_mode) &
-        (pl.col('pitchangle1_avg').abs() < filter_pitch_angle)
+
+    # 记录不满足累计时间条件的风机数据
+    integrity_problem_dict['whole'] = df.filter(
+        ~pl.col('turbine_id').is_in(wholecumtime_satisfy_idlist)
     )
+
+    # 计算满足条件的风机数据的风速分箱累计时间
+    bincumtime = df_wholecumtime_satisfy.group_by(['turbine_id', 'label_windspeedbin']).agg([
+        pl.col('time_interval').sum().alias('bin_total_time')
+    ])
+
+    # 找出满足分箱累计时间条件的风机ID
+    bincumtime_satisfy_idlist = bincumtime.filter(
+        pl.col('bin_total_time') >= pl.duration(seconds=validation_bincumtime)
+    ).get_column('turbine_id').unique()
+
+    # 记录不满足风速分箱累计时间条件的风机数据
+    integrity_problem_dict['bin'] = df.filter(
+        ~pl.col('turbine_id').is_in(bincumtime_satisfy_idlist)
+    )
+
+    # 新增完整性验证标签列
+    df = df.with_columns([
+        pl.col('turbine_id')
+        .is_in(wholecumtime_satisfy_idlist)
+        .cast(pl.Int8)
+        .alias('label_integirity_validation')
+    ])
+
+    # 删除临时列
+    df = df.drop(['label_windspeedbin', 'time_interval'])
+
+    print(integrity_problem_dict)
+
+    return df
+
+# def filter_data(df: pl.DataFrame = None,
+#                 filter_time_range: list = [20231013, 20231216],
+#                 average_time_interval: int = 600,
+#                 filter_turbine_operation_mode: int = 20, 
+#                 filter_pitch_angle: int = 3, 
+#                 ) -> pl.DataFrame:
+#     """
+#     Filter data based on specified conditions
     
-    # Group by time window and turbine_id, then calculate averages
-    if average_time_interval > 0:
-        filtered_df = filtered_df.group_by([
-            pl.col('time').dt.truncate(f'{average_time_interval}s'),
-            'turbine_id'
-        ]).agg([
-            pl.col('windspeed_avg').mean(),
-            pl.col('winddirection_avg').mean(),
-            pl.col('winddirection_relative_avg').mean(),
-            pl.col('yawposition_avg').mean(),
-            pl.col('pitchangle1_avg').mean(),
-            pl.col('generatorspeed_avg').mean(),
-            pl.col('power_avg').mean(),
-            pl.col('airdensity_avg').mean(),
-            # pl.col('operatingmode_cntmax').mode(),
-            # pl.col('yawmode_cntmax').mode(),
-            # pl.col('brakemode_cntmax').mode()
-        ])
+#     Args:
+#         df (pl.DataFrame, optional): Input DataFrame. Defaults to None.
+#         filter_time_range (list): Start and end dates in YYYYMMDD format
+#         average_time_interval (int): Time interval in seconds for data averaging
+#         filter_turbine_operation_mode (int): Operating mode to filter
+#         filter_pitch_angle (int): Maximum pitch angle for filtering
+        
+#     Returns:
+#         pl.DataFrame: Filtered DataFrame
+#     """
+#     if df is None:
+#         df = pl.read_parquet(PATH_PARQUET_FILE)
     
-    return filtered_df
+#     # Convert time range to datetime
+#     start_time = pl.datetime(
+#         year=int(str(filter_time_range[0])[:4]),
+#         month=int(str(filter_time_range[0])[4:6]),
+#         day=int(str(filter_time_range[0])[6:8])
+#     end_time = pl.datetime(
+#         year=int(str(filter_time_range[1])[:4]),
+#         month=int(str(filter_time_range[1])[4:6]),
+#         day=int(str(filter_time_range[1])[6:8])
+    
+#     # Apply filters
+#     filtered_df = df.filter(
+#         (pl.col('time') >= start_time) &
+#         (pl.col('time') <= end_time) &
+#         # (pl.col('operatingmode_cntmax') == filter_turbine_operation_mode) &
+#         (pl.col('pitchangle1_avg').abs() < filter_pitch_angle)
+#     )
+    
+#     # Group by time window and turbine_id, then calculate averages
+#     if average_time_interval > 0:
+#         filtered_df = filtered_df.group_by([
+#             pl.col('time').dt.truncate(f'{average_time_interval}s'),
+#             'turbine_id'
+#         ]).agg([
+#             pl.col('windspeed_avg').mean(),
+#             pl.col('winddirection_avg').mean(),
+#             pl.col('winddirection_relative_avg').mean(),
+#             pl.col('yawposition_avg').mean(),
+#             pl.col('pitchangle1_avg').mean(),
+#             pl.col('generatorspeed_avg').mean(),
+#             pl.col('power_avg').mean(),
+#             pl.col('airdensity_avg').mean(),
+#             # pl.col('operatingmode_cntmax').mode(),
+#             # pl.col('yawmode_cntmax').mode(),
+#             # pl.col('brakemode_cntmax').mode()
+#         ])
+    
+#     return filtered_df
     
 def windspeed_normalized_byairdensity(df = None,
                                     #   R0: float = 287.05,
@@ -541,6 +727,7 @@ def compute_weight_power(
              .with_columns((pl.col('power_mean') * pl.col('probability')).alias('weighted_power')))
     
     return result
+
 
 # %% Main processing
 if __name__ == '__main__':
