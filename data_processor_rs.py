@@ -103,7 +103,7 @@ def label_timeseria_type(df: pl.DataFrame = None,
     if df is None:
         df = pl.read_parquet(PATH_PARQUET_FILE)
 
-    timeseria_problem_data_dict = {}
+    dict_timeseria_problem_data = {}
 
     # Sort by turbine_id and time
     df = df.sort(['turbine_id', 'time'])
@@ -112,7 +112,7 @@ def label_timeseria_type(df: pl.DataFrame = None,
     df = df.with_columns([
         pl.col('turbine_id').is_null().or_(pl.col('time').is_null()).alias('label_idtime_null')
     ])
-    timeseria_problem_data_dict['idtime_nan_data'] = df.filter(pl.col('label_idtime_null') == 1)
+    dict_timeseria_problem_data['idtime_nan_data'] = df.filter(pl.col('label_idtime_null') == 1)
 
     # Label idtime duplicate type
     df = df.with_columns([
@@ -131,7 +131,7 @@ def label_timeseria_type(df: pl.DataFrame = None,
         .alias('label_idtime_duplicated')
     ])
 
-    timeseria_problem_data_dict['idtime_duplicated_data'] = df.filter(pl.col('label_idtime_duplicated') != 0)
+    dict_timeseria_problem_data['idtime_duplicated_data'] = df.filter(pl.col('label_idtime_duplicated') != 0)
     
     # Label time continuity type
     df = df.with_columns([
@@ -153,9 +153,9 @@ def label_timeseria_type(df: pl.DataFrame = None,
         (pl.col('time') - pl.col('time_interval')).alias('start_time')
     ])
     
-    timeseria_problem_data_dict['idtime_notcontinuity_data'] = df_notcontinuity_data
+    dict_timeseria_problem_data['idtime_notcontinuity_data'] = df_notcontinuity_data
 
-    print(timeseria_problem_data_dict)
+    print(dict_timeseria_problem_data)
 
     # Drop temporary columns
     df = df.drop(['time_interval', 'idtime_is_duplicated', 'idtime', 'idtime_is_first_distinct'])
@@ -181,7 +181,7 @@ def label_outliers_type(df: pl.DataFrame = None,
     if df is None:
         df = pl.read_parquet(PATH_PARQUET_FILE)
 
-    outlier_problem_dict = {}
+    dict_outlier_problem_data = {}
     
     # Get numeric columns excluding time and turbine_id
     num_col_list = [col for col in df.columns if col not in ['time', 'turbine_id']]
@@ -200,7 +200,7 @@ def label_outliers_type(df: pl.DataFrame = None,
     ])
     
     # Store NaN data in outlier problem dict
-    outlier_problem_dict['NaN_data'] = df.filter(pl.col('label_NaN_type') != 0)
+    dict_outlier_problem_data['NaN_data'] = df.filter(pl.col('label_NaN_type') != 0)
     
     # Label continuous duplicate values
     col_float_set = set(df.columns) & set(column_float_type)
@@ -218,22 +218,22 @@ def label_outliers_type(df: pl.DataFrame = None,
             (pl.col(col).eq(pl.col(col).shift(-1)) & 
              pl.col(col).eq(pl.col(col).shift(-2)))
             .fill_null(False)
-            .alias(f'continue_duplicate_type_{col}')
+            .alias(f'label_continue_duplicate_type_{col}')
         ])
         
         # Update shifted values
         df = df.with_columns([
-            pl.when(pl.col(f'continue_duplicate_type_{col}'))
-            .then(pl.col(f'continue_duplicate_type_{col}').shift(1))
-            .otherwise(pl.col(f'continue_duplicate_type_{col}'))
-            .alias(f'continue_duplicate_type_{col}')
+            pl.when(pl.col(f'label_continue_duplicate_type_{col}'))
+            .then(pl.col(f'label_continue_duplicate_type_{col}').shift(1))
+            .otherwise(pl.col(f'label_continue_duplicate_type_{col}'))
+            .alias(f'label_continue_duplicate_type_{col}')
         ])
         
         df = df.with_columns([
-            pl.when(pl.col(f'continue_duplicate_type_{col}'))
-            .then(pl.col(f'continue_duplicate_type_{col}').shift(2))
-            .otherwise(pl.col(f'continue_duplicate_type_{col}'))
-            .alias(f'continue_duplicate_type_{col}')
+            pl.when(pl.col(f'label_continue_duplicate_type_{col}'))
+            .then(pl.col(f'label_continue_duplicate_type_{col}').shift(2))
+            .otherwise(pl.col(f'label_continue_duplicate_type_{col}'))
+            .alias(f'label_continue_duplicate_type_{col}')
         ])
     
     # Label out-of-range wind speed
@@ -242,7 +242,7 @@ def label_outliers_type(df: pl.DataFrame = None,
         .alias('label_overrange_windspeed')
     ])
     
-    print(outlier_problem_dict)
+    print(dict_outlier_problem_data)
 
     return df
 
@@ -289,7 +289,7 @@ def label_situations_type(df: pl.DataFrame,
     
     return df
 
-def label_operation(df: pl.DataFrame) -> pl.DataFrame:
+def label_operation_type(df: pl.DataFrame) -> pl.DataFrame:
     """
     对风向数据进行分类标签化处理。
 
@@ -300,8 +300,8 @@ def label_operation(df: pl.DataFrame) -> pl.DataFrame:
         pl.DataFrame: 包含风向分类标签的 DataFrame。
     """
     # 创建风向划分的区间（每 22.5 度一个区间），从 0 到 360 度
-    wdb = np.arange(0, 382.5, 22.5)
-    wdb_label = [i for i in range(16)]
+    wdb = np.arange(22.5, 360, 22.5)
+    wdb_label = [str(i) for i in range(16)]
     
     # 使用 polars 的 cut 函数对风向数据进行分箱
     df = df.with_columns([
@@ -315,8 +315,8 @@ def label_operation(df: pl.DataFrame) -> pl.DataFrame:
     ])
     
     # 对偏航位置进行同样的处理
-    npb = np.arange(0, 382.5, 22.5)
-    npb_label = [i for i in range(16)]
+    npb = np.arange(22.5, 360, 22.5)
+    npb_label = [str(i) for i in range(16)]
     
     df = df.with_columns([
         pl.col('yawposition_avg')
@@ -330,6 +330,7 @@ def label_operation(df: pl.DataFrame) -> pl.DataFrame:
 
     return df
 
+# Fix from here
 def integrity_validation(
     df: pl.DataFrame = None,
     validation_windspeedbinvalue: float = 0.5,
@@ -363,8 +364,8 @@ def integrity_validation(
         validation_windspeedbinvalue
     )
     validation_bins_label = [
-        f'({validation_windspeedbin[i]}, {validation_windspeedbin[i+1]})'
-        for i in range(len(validation_windspeedbin)-1)
+        str(i)
+        for i in range(len(validation_windspeedbin) + 1)
     ]
     
     # 将 'windspeed_avg' 列的数据划分到指定的风速分箱中
