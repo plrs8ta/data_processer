@@ -1,11 +1,20 @@
 # %%
+# Relay
 import pandas as pd
 import numpy as np
 import polars as pl
 from pathlib import Path
 import os
+from pathlib import Path
 
-# Vars
+from openoa.utils import filters, power_curve, plot
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+
+# %%
+# Default varis
 # File Path
 PATH_CSV_FILE = Path(r'D:\temp_data\SCADAdata_23\aggregated_data_60s(test_51turbines_ori).csv')
 PATH_PARQUET_FILE = Path(r'D:\temp_data\SCADAdata_23\aggregated_data_60s(test_51turbines_ori)_test.parquet')
@@ -30,7 +39,7 @@ DICT_COLUMN_MAPPING = {
 }
 # Time column name
 COLUMN_TIME = 'rectime'    # should be repalce by original data time clomun name if wanna change time type to pyarrow time type
-# analysis reley on basic columns
+# Basic columns list
 LIST_BASIC_COLUMN = [
     'time','turbine_id', # 时间，机组编号
     'windspeed_avg', 
@@ -162,7 +171,6 @@ def label_timeseria_type(df: pl.DataFrame = None,
 
     return df
 
-
 def label_outliers_type(df: pl.DataFrame = None,
                        column_float_type: list = ['windspeed_avg', 'winddirection_avg'],
                        continuety_num: int = 3) -> pl.DataFrame:
@@ -215,8 +223,7 @@ def label_outliers_type(df: pl.DataFrame = None,
     # Check for continuous duplicate values
     for col in col_float_set:
         df = df.with_columns([
-            (pl.col(col).eq(pl.col(col).shift(-1)) & 
-             pl.col(col).eq(pl.col(col).shift(-2)))
+            pl.col(col).eq(pl.col(col).shift(-1))
             .fill_null(False)
             .alias(f'label_continue_duplicate_type_{col}')
         ])
@@ -714,6 +721,40 @@ def compute_wind_probability(df: pl.DataFrame) -> pl.DataFrame:
     
     return result
 
+def compute_wind_probability_farm(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    计算整个风电场的风频分布，但保持每个风机的输出结构。
+    
+    首先计算整个风电场的风频分布（所有风机数据合并计算），
+    然后复制到每个风机以保持与compute_wind_probability()相同的输出结构。
+
+    Args:
+        df (pl.DataFrame): 输入数据框，需包含 turbine_id 和 label_normalized_windspeedbin_byairdensity 列
+
+    Returns:
+        pl.DataFrame: 包含每个风速区间的概率分布，但每个风机的概率值相同
+    """
+    # 首先计算整个风电场的风频分布
+    farm_probability = (df.group_by('label_normalized_windspeedbin_byairdensity')
+                       .agg(pl.len().alias('farm_count'))
+                       .with_columns(
+                           (pl.col('farm_count') / pl.col('farm_count').sum()).alias('farm_probability')
+                       ))
+    
+    # 获取所有唯一的turbine_id
+    unique_turbines = df.select('turbine_id').unique()
+    
+    # 为每个风机复制场级概率
+    result = (unique_turbines.join(
+        farm_probability,
+        how='cross'  # 笛卡尔积，确保每个风机都有所有风速区间的概率
+    ).with_columns([
+        pl.col('farm_probability').alias('probability'),  # 重命名以匹配原函数输出
+    ]).drop('farm_count', 'farm_probability')
+    .sort(['turbine_id', 'label_normalized_windspeedbin_byairdensity']))
+    
+    return result
+
 def compute_weight_power(
     df_power_curve: pl.DataFrame, 
     df_wind_probability: pl.DataFrame,
@@ -729,18 +770,278 @@ def compute_weight_power(
     
     return result
 
+def filter_data(df: pl.DataFrame = None,
+                filter_time_range: list = None,  # Changed default to None
+                average_time_interval: int = 600,
+                filter_turbine_operation_mode: int = 20, 
+                filter_pitch_angle: int = 3, 
+                filter_turbine_speed: int = 1000
+                ) -> pl.DataFrame:
+    """
+    Filter data based on specified conditions
+    
+    Args:
+        df (pl.DataFrame, optional): Input DataFrame. Defaults to None.
+        filter_time_range (list, optional): Start and end dates in YYYYMMDD format. If None, all dates are included.
+        average_time_interval (int): Time interval in seconds for data averaging
+        filter_turbine_operation_mode (int): Operating mode to filter
+        filter_pitch_angle (int): Maximum pitch angle for filtering
+        filter_turbine_speed (float): Minimum generator speed for filtering
+        
+    Returns:
+        pl.DataFrame: Filtered DataFrame
+    """
+    if df is None:
+        df = pl.read_parquet(PATH_PARQUET_FILE)
+    
+    # Start with base filters
+    filter_conditions = [
+        (pl.col('pitchangle1_avg').abs() < filter_pitch_angle),
+        (pl.col('generatorspeed_avg').abs() >= filter_turbine_speed)
+    ]
+    
+    # Add time range filter if specified
+    if filter_time_range is not None:
+        start_time = pl.datetime(
+            year=int(str(filter_time_range[0])[:4]),
+            month=int(str(filter_time_range[0])[4:6]),
+            day=int(str(filter_time_range[0])[6:8]))
+        end_time = pl.datetime(
+            year=int(str(filter_time_range[1])[:4]),
+            month=int(str(filter_time_range[1])[4:6]),
+            day=int(str(filter_time_range[1])[6:8]))
+        filter_conditions.extend([
+            (pl.col('time') >= start_time),
+            (pl.col('time') <= end_time)
+        ])
+    
+    # Apply filters
+    filtered_df = df.filter(
+        (pl.col('time') >= start_time) &
+        (pl.col('time') <= end_time) &
+        # (pl.col('operatingmode_cntmax') == filter_turbine_operation_mode) &
+        (pl.col('pitchangle1_avg').abs() < filter_pitch_angle) &
+        (pl.col('generatorspeed_avg').abs() >= filter_turbine_speed)
+    )
+    
+    # Group by time window and turbine_id, then calculate averages
+    if average_time_interval > 0:
+        filtered_df = filtered_df.group_by([
+            pl.col('time').dt.truncate(f'{average_time_interval}s'),
+            'turbine_id'
+        ]).agg([
+            pl.col('windspeed_avg').mean(),
+            pl.col('winddirection_avg').mean(),
+            pl.col('winddirection_relative_avg').mean(),
+            pl.col('yawposition_avg').mean(),
+            pl.col('pitchangle1_avg').mean(),
+            pl.col('generatorspeed_avg').mean(),
+            pl.col('power_avg').mean(),
+            pl.col('airdensity_avg').mean(),
+            # pl.col('operatingmode_cntmax').mode(),
+            # pl.col('yawmode_cntmax').mode(),
+            # pl.col('brakemode_cntmax').mode()
+        ])
+    
+    return filtered_df
+
+def process_scada_data(df: pl.DataFrame,
+                      filter_dates: list,
+                      avg_time_interval: int,
+                      turbine_op_mode: int,
+                      pitch_angle: float,
+                      turbine_speed:float, 
+                      wind_speed_bin: float,
+                      max_wind_speed: float,
+                      min_wind_speed: float,
+                      wind_probality=None, 
+                      use_air_density_norm: bool = True) -> pl.DataFrame:
+    """
+    Process SCADA data with given parameters and return processed results
+    
+    Args:
+        df: Input DataFrame
+        filter_dates: List of [start_date, end_date] in YYYYMMDD format
+        avg_time_interval: Time interval for averaging in seconds
+        turbine_op_mode: Turbine operation mode to filter
+        pitch_angle: Maximum pitch angle for filtering
+        wind_speed_bin: Wind speed bin size
+        max_wind_speed: Maximum wind speed for binning
+        min_wind_speed: Minimum wind speed for binning
+        wind_probality: Optional pre-calculated wind probability distribution
+        use_air_density_norm: Whether to normalize wind speed by air density
+    
+    Returns:
+        Tuple[pl.DataFrame, pl.DataFrame]: (weighted power results, wind probability distribution)
+    """
+    # Apply filters and processing
+    df = filter_data(
+        df, 
+        filter_time_range=filter_dates,
+        average_time_interval=avg_time_interval,
+        filter_turbine_operation_mode=turbine_op_mode,
+        filter_pitch_angle=pitch_angle, 
+        filter_turbine_speed=turbine_speed
+    )
+    
+    if use_air_density_norm:
+        df = windspeed_normalized_byairdensity(df)
+    else:
+        # If not using air density normalization, just copy windspeed_avg
+        df = df.with_columns(
+            pl.col('windspeed_avg').alias('normalized_windspeed_byairdensity')
+        )
+
+    df, df_pc = compute_power_curve(
+        df,
+        normalized_windspeedbinvalue=wind_speed_bin,
+        normalized_windspeedmax=max_wind_speed,
+        normalized_windspeedmin=min_wind_speed
+    )
+
+    # Calculate or use provided wind probability
+    df_wind_probability = wind_probality if wind_probality is not None else compute_wind_probability_farm(df)
+    
+    # Calculate weighted power
+    df_wp = compute_weight_power(df_pc, df_wind_probability)
+
+    return df_wp, df_wind_probability, df
+
+def compare_data():
+    df_24 = pl.read_parquet(PATH_PARQUET_FILE_SCADA24)
+    df_wp_24, wind_probality_SCADA24= process_scada_data(
+                    df_24,
+                    filter_dates=[20241013, 20241216],
+                    avg_time_interval=600,
+                    turbine_op_mode=20,
+                    pitch_angle=3,
+                    turbine_speed=1000, 
+                    wind_speed_bin=0.5,
+                    max_wind_speed=15,
+                    min_wind_speed=2.5,
+                    wind_probality=None, 
+                    use_air_density_norm=False
+                )
+    df_24 = None
+
+    df_23 = pl.read_parquet(PATH_PARQUET_FILE_SCADA23)
+    df_wp_23, wind_probality_SCADA23= process_scada_data(
+                        df_23,
+                        filter_dates=[20231013, 20231216],
+                        avg_time_interval=600,
+                        turbine_op_mode=20,
+                        pitch_angle=10,
+                        turbine_speed=0, 
+                        wind_speed_bin=0.5,
+                        max_wind_speed=15,
+                        min_wind_speed=2.5,
+                        wind_probality=wind_probality_SCADA24, 
+                        use_air_density_norm=False
+                    )
+    df_23 = None
+    
+    df_merge = df_wp_23.join(
+        df_wp_24,
+        on=['turbine_id', 'label_normalized_windspeedbin_byairdensity'],
+        how='inner',  # Changed from 'outer' to 'inner' to only keep matching records
+        suffix='_24'  # This will add '_24' to all right-side columns
+    ).sort(['turbine_id', 'label_normalized_windspeedbin_byairdensity'])
+
+    return df_merge
+
+def draw_power_curve():
+    # Get sorted turbine IDs
+    sorted_turbine_ids = pl.scan_parquet(PATH_PARQUET_FILE_SCADA24)\
+                            .select("turbine_id")\
+                            .unique()\
+                            .sort("turbine_id")\
+                            .collect()\
+                            .get_column("turbine_id")\
+                            .to_list()
+    # sorted_turbine_ids = sorted_turbine_ids.collect()
+
+    for turbine_id in sorted_turbine_ids:
+        # Load 2024 data
+        df_24 = (
+            pl.scan_parquet(PATH_PARQUET_FILE_SCADA24)
+            .filter(pl.col("turbine_id") == turbine_id)
+            .collect()
+        )
+        df_24 = filter_data(df_24, 
+                         filter_time_range=[20241013, 20241216], 
+                         average_time_interval=600, 
+                         filter_pitch_angle=3, 
+                         filter_turbine_speed=1000
+                         )
+        df_24 = df_24.filter(pl.col('windspeed_avg') <= 12.5)
+        # Load 2023 data
+        df_23 = (
+            pl.scan_parquet(PATH_PARQUET_FILE_SCADA23)
+            .filter(pl.col("turbine_id") == turbine_id)
+            .collect()
+        )
+        df_23 = filter_data(df_23,  # Fixed: Changed df_24 to df_23
+                         filter_time_range=[20231013, 20231216], 
+                         average_time_interval=600, 
+                         filter_pitch_angle=3, 
+                         filter_turbine_speed=1000
+                         )
+        df_23 = df_23.filter(pl.col('windspeed_avg') <= 12.5)
+        
+        # Convert to pandas for plotting
+        df_23 = df_23.to_pandas()
+        df_24 = df_24.to_pandas()
+
+        # Calculate spline curves
+        spline_curve_23 = power_curve.gam(df_23['windspeed_avg'], df_23['power_avg'], n_splines=20)
+        spline_curve_24 = power_curve.gam(df_24['windspeed_avg'], df_24['power_avg'], n_splines=20)
+
+        # Create figure with more space for title
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Plot scatter points
+        ax.scatter(df_23['windspeed_avg'], 
+                  df_23['power_avg'],
+                  alpha=0.4, 
+                  s=10, 
+                  color='C0',
+                  label='Scatter (Before Optimization)')
+        
+        ax.scatter(df_24['windspeed_avg'], 
+                  df_24['power_avg'], 
+                  alpha=0.4, 
+                  s=10, 
+                  color='C2',
+                  label='Scatter (After Optimization)')
+
+        # Plot spline curves
+        x = np.linspace(0, 20, 100)
+        ax.plot(x, spline_curve_23(x), color="C0", label="Power Curve (Before Optimization)", linewidth=6)
+        ax.plot(x, spline_curve_24(x), color="C2", label="Power Curve (After Optimization)", linewidth=6)
+
+        # Customize plot
+        ax.set_xlim(-1, 20)
+        ax.set_ylim(-100, 2100)
+        ax.set_xlabel('Wind Speed (m/s)')
+        ax.set_ylabel('Power (kW)')
+        ax.legend(loc='upper left')
+        
+        # Add title with turbine ID
+        plt.suptitle(f'Turbine {turbine_id} Power Curve Comparison (Before vs After Optimization)', 
+                    fontsize=16, 
+                    y=0.95)
+        
+        # Adjust layout and display
+        plt.tight_layout()
+        plt.show()
+        
+        # Optional: add a small delay between plots
+        plt.pause(0.1)
+
+
 
 # %% Main processing
-if __name__ == '__main__':
-    
-    df = pl.read_parquet(PATH_PARQUET_FILE_SCADA24)
-    df = filter_data(df, filter_time_range=[20241013, 20241216])
-    df = windspeed_normalized_byairdensity(df)
-    df, df_pc = compute_power_curve(df)
-    df_AEP = compoute_AEP(df, df_pc)
-    # df_Cp = compute_Cp(df_pc)
-    df_wind_probability = compute_wind_probability(df)
-    df_wp = compute_weight_power(df_pc, df_wind_probability)
+
 
 
 # %% 
@@ -752,3 +1053,245 @@ df_merge = df_SCADA23.join(
     # right_on=['turbine_id_SCADA24', 'label_normalized_windspeedbin_byairdensity_SCADA24'], 
     how='left'
     )
+
+# Set page config
+st.set_page_config(
+    page_title="SCADA Data Analysis",
+    page_icon="🌬️",
+    layout="wide"
+)
+
+# Title and description
+st.title("Wind Turbine SCADA Data Analysis")
+st.markdown("""
+This application allows you to analyze SCADA data from wind turbines with customizable parameters.
+Use the sidebar to adjust parameters and view the results.
+""")
+
+# Sidebar for parameters
+st.sidebar.header("Analysis Parameters")
+
+# Data source selection
+data_source_option = st.sidebar.radio(
+    "Data Source Option",
+    ["Use Default Data", "Upload Custom Data"],
+    index=0
+)
+
+if data_source_option == "Use Default Data":
+    data_source = st.sidebar.selectbox(
+        "Select Default Data Source",
+        ["SCADA 2023", "SCADA 2024"],
+        index=0
+    )
+    file_path = PATH_PARQUET_FILE_SCADA23 if data_source == "SCADA 2023" else PATH_PARQUET_FILE_SCADA24
+else:
+    uploaded_file = st.sidebar.file_uploader("Upload SCADA Data File", type=["csv", "parquet"])
+    if uploaded_file is not None:
+        st.sidebar.success(f"Uploaded: {uploaded_file.name}")
+
+# Date range selection
+st.sidebar.subheader("Date Range")
+start_date = st.sidebar.date_input("Start Date", value=pd.to_datetime("2023-10-13"))
+end_date = st.sidebar.date_input("End Date", value=pd.to_datetime("2023-12-16"))
+
+# Convert dates to YYYYMMDD format
+start_date_int = int(start_date.strftime("%Y%m%d"))
+end_date_int = int(end_date.strftime("%Y%m%d"))
+
+# Technical parameters
+st.sidebar.subheader("Technical Parameters")
+avg_time_interval = st.sidebar.slider("Time Averaging Interval (seconds)", 60, 3600, 600, 60)
+turbine_op_mode = st.sidebar.number_input("Turbine Operation Mode", 0, 100, 20)
+pitch_angle = st.sidebar.slider("Maximum Pitch Angle (degrees)", 0.0, 20.0, 3.0, 0.1)
+turbine_speed = st.sidebar.slider("Minimum Generator Speed (rpm)", 0, 2000, 1000, 10)
+
+# Wind speed parameters
+st.sidebar.subheader("Wind Speed Parameters")
+wind_speed_bin = st.sidebar.slider("Wind Speed Bin Size", 0.1, 2.0, 0.5, 0.1)
+min_wind_speed = st.sidebar.slider("Minimum Wind Speed (m/s)", 0.0, 5.0, 2.5, 0.1)
+max_wind_speed = st.sidebar.slider("Maximum Wind Speed (m/s)", 10.0, 25.0, 15.0, 0.5)
+
+# Air density normalization
+use_air_density_norm = st.sidebar.checkbox("Normalize Wind Speed by Air Density", True)
+
+# Process button
+process_button = st.sidebar.button("Process Data", type="primary")
+
+# Main content area
+if process_button:
+    try:
+        # Load data based on selection
+        if data_source_option == "Use Default Data":
+            with st.spinner(f"Loading default data from {file_path}..."):
+                df = pl.read_parquet(file_path)
+                st.success(f"Successfully loaded data from {file_path}")
+        else:
+            if uploaded_file is not None:
+                with st.spinner(f"Loading uploaded file: {uploaded_file.name}..."):
+                    # Determine file type and read accordingly
+                    file_extension = uploaded_file.name.split('.')[-1].lower()
+                    if file_extension == 'csv':
+                        df = pl.read_csv(uploaded_file)
+                    elif file_extension == 'parquet':
+                        df = pl.read_parquet(uploaded_file)
+                    else:
+                        st.error("Unsupported file format. Please upload a CSV or Parquet file.")
+                        st.stop()
+                    st.success(f"Successfully loaded data from uploaded file: {uploaded_file.name}")
+            else:
+                st.error("Please upload a data file or select 'Use Default Data'")
+                st.stop()
+        
+        # Process data with progress reporting
+        with st.spinner("Filtering data..."):
+            df_filtered = filter_data(
+                df, 
+                filter_time_range=[start_date_int, end_date_int],
+                average_time_interval=avg_time_interval,
+                filter_turbine_operation_mode=turbine_op_mode,
+                filter_pitch_angle=pitch_angle, 
+                filter_turbine_speed=turbine_speed
+            )
+            
+        with st.spinner("Normalizing wind speed..."):
+            if use_air_density_norm:
+                df_normalized = windspeed_normalized_byairdensity(df_filtered)
+            else:
+                # If not using air density normalization, just copy windspeed_avg
+                df_normalized = df_filtered.with_columns(
+                    pl.col('windspeed_avg').alias('normalized_windspeed_byairdensity')
+                )
+        
+        with st.spinner("Computing power curve..."):
+            df_processed, df_pc = compute_power_curve(
+                df_normalized,
+                normalized_windspeedbinvalue=wind_speed_bin,
+                normalized_windspeedmax=max_wind_speed,
+                normalized_windspeedmin=min_wind_speed
+            )
+        
+        with st.spinner("Computing wind probability..."):
+            # Calculate or use provided wind probability
+            df_wind_probability = compute_wind_probability_farm(df_processed)
+        
+        with st.spinner("Computing weighted power..."):
+            # Calculate weighted power
+            df_wp = compute_weight_power(df_pc, df_wind_probability)
+        
+        # Display results in tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["Power Curve", "Wind Probability", "Weighted Power", "Raw Data"])
+        
+        with tab1:
+            st.header("Power Curve Analysis")
+            
+            # Get unique turbine IDs
+            turbine_ids = df_processed["turbine_id"].unique().to_list()
+            selected_turbine = st.selectbox("Select Turbine", turbine_ids)
+            
+            # Filter data for selected turbine
+            turbine_data = df_processed.filter(pl.col("turbine_id") == selected_turbine)
+            
+            # Create power curve plot
+            fig = px.scatter(
+                turbine_data.to_pandas(), 
+                x="normalized_windspeed_byairdensity" if use_air_density_norm else "windspeed_avg", 
+                y="power_avg",
+                title=f"Power Curve for Turbine {selected_turbine}",
+                labels={
+                    "normalized_windspeed_byairdensity": "Normalized Wind Speed (m/s)" if use_air_density_norm else "Wind Speed (m/s)",
+                    "power_avg": "Power (kW)"
+                }
+            )
+            
+            # Add trend line
+            fig.update_traces(marker=dict(size=5, opacity=0.6))
+            fig.update_layout(height=600)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Display binned power curve data
+            st.subheader("Binned Power Curve Data")
+            binned_data = df_wp.filter(pl.col("turbine_id") == selected_turbine)
+            st.dataframe(binned_data.to_pandas())
+        
+        with tab2:
+            st.header("Wind Probability Distribution")
+            
+            # Create wind probability plot
+            fig = px.bar(
+                df_wind_probability.to_pandas(), 
+                x="label_normalized_windspeedbin_byairdensity", 
+                y="probability",
+                color="turbine_id",
+                title="Wind Speed Probability Distribution",
+                labels={
+                    "label_normalized_windspeedbin_byairdensity": "Wind Speed Bin",
+                    "probability": "Probability"
+                }
+            )
+            fig.update_layout(height=600)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Display wind probability data
+            st.subheader("Wind Probability Data")
+            st.dataframe(df_wind_probability.to_pandas())
+        
+        with tab3:
+            st.header("Weighted Power Analysis")
+            
+            # Calculate AEP for each turbine
+            aep_data = df_wp.group_by("turbine_id").agg(
+                pl.sum("weighted_power").alias("AEP")
+            )
+            
+            # Create AEP bar chart
+            fig = px.bar(
+                aep_data.to_pandas(),
+                x="turbine_id",
+                y="AEP",
+                title="Annual Energy Production (AEP) by Turbine",
+                labels={
+                    "turbine_id": "Turbine ID",
+                    "AEP": "Annual Energy Production (kWh)"
+                }
+            )
+            fig.update_layout(height=500)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Display weighted power data
+            st.subheader("Weighted Power Data")
+            st.dataframe(df_wp.to_pandas())
+        
+        with tab4:
+            st.header("Processed Raw Data")
+            
+            # Show sample of processed data
+            st.subheader("Sample of Processed Data")
+            st.dataframe(df_processed.head(1000).to_pandas())
+            
+            # Data statistics
+            st.subheader("Data Statistics")
+            stats = df_processed.describe()
+            st.dataframe(stats.to_pandas())
+            
+            # Download button for processed data
+            csv = df_processed.to_pandas().to_csv(index=False)
+            st.download_button(
+                label="Download Processed Data as CSV",
+                data=csv,
+                file_name=f"processed_data_{data_source.replace(' ', '_')}.csv",
+                mime="text/csv"
+            )
+            
+    except Exception as e:
+        st.error(f"Error processing data: {str(e)}")
+        st.error("详细错误信息：")
+        st.exception(e)  # 显示完整的错误堆栈跟踪
+else:
+    # Display instructions when app first loads
+    st.info("👈 Adjust parameters in the sidebar and click 'Process Data' to start the analysis.")
+    
+    # Show sample image or placeholder
+    st.image("https://www.energy.gov/sites/default/files/styles/full_article_width/public/2021-12/wind-turbines-1747331_1920.jpg", 
+             caption="Wind Turbines (Source: energy.gov)")
+# %%
